@@ -28,10 +28,10 @@ def test_release_script_validates_before_writing_and_updates_lock(tmp_path):
         [sys.executable, str(script), "3.0.0"], cwd=tmp_path.parent, capture_output=True
     )
     assert result.returncode == 0, result.stderr
-    assert json.loads(package.read_text())["version"] == "3.0.0"
-    lock = json.loads((tmp_path / "combicode-js/package-lock.json").read_text())
+    assert json.loads(package.read_text(encoding="utf-8"))["version"] == "3.0.0"
+    lock = json.loads((tmp_path / "combicode-js/package-lock.json").read_text(encoding="utf-8"))
     assert lock["version"] == lock["packages"][""]["version"] == "3.0.0"
-    assert "3.0.0" in (tmp_path / "combicode-py/combicode/__init__.py").read_text()
+    assert "3.0.0" in (tmp_path / "combicode-py/combicode/__init__.py").read_text(encoding="utf-8")
 
 
 def test_packaged_ignore_rules_match_canonical_source():

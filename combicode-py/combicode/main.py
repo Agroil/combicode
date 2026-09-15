@@ -33,7 +33,7 @@ When answering questions or writing code, adhere strictly to the functions, vari
 A code map with expanded tree structure is provided below for a high-level overview."""
 
 # Minimal safety ignores
-DEFAULT_IGNORES = json.loads(Path(__file__).with_name("ignore.json").read_text())
+DEFAULT_IGNORES = json.loads(Path(__file__).with_name("ignore.json").read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ from combicode.archive import parse_archive, record, restore
 from combicode.main import cli
 
 ROOT = Path(__file__).resolve().parents[2]
-FIXTURES = json.loads((ROOT / "tests/fixtures/archive.json").read_text())
+FIXTURES = json.loads((ROOT / "tests/fixtures/archive.json").read_text(encoding="utf-8"))
 METADATA = "OL: 1-1 | ML: 4-4 | 1B"
 
 
