@@ -2,7 +2,7 @@ name: Publish Python Package to PyPI
 
 on:
   release:
-    types: [created]
+    types: [published]
 
 jobs:
   pypi-publish:
@@ -12,27 +12,35 @@ jobs:
       name: pypi
       url: https://pypi.org/p/combicode
     permissions:
+      contents: read
       id-token: write # this is required for trusted publishing
     defaults:
       run:
         working-directory: ./combicode-py
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Sync shared assets into package
         run: |
-          chmod +x ./scripts/sync-assets.sh
-          ./scripts/sync-assets.sh
+          bash scripts/sync-assets.sh
         working-directory: . # Run from root
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v7.0.0
         with:
-          python-version: "3.x"
+          python-version: "3.14"
 
       - name: Install dependencies
-        run: python -m pip install --upgrade pip build
+        run: python -m pip install --upgrade pip build==1.6.1
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Install JavaScript test dependencies
+        run: npm ci --ignore-scripts
+        working-directory: ./combicode-js
 
       - name: Run Tests
         run: |

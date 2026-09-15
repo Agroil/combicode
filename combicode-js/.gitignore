@@ -16,7 +16,6 @@ dist
 .pytest_cache
 .npm
 pnpm-lock.yaml
-package-lock.json
 .next
 .DS_Store
 Thumbs.db

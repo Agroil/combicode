@@ -2,7 +2,7 @@ name: Publish Node.js Package to NPM
 
 on:
   release:
-    types: [created]
+    types: [published]
 
 jobs:
   build-and-publish:
@@ -15,27 +15,26 @@ jobs:
         working-directory: ./combicode-js
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Sync shared assets into package
         run: |
-          chmod +x ./scripts/sync-assets.sh
-          ./scripts/sync-assets.sh
+          bash scripts/sync-assets.sh
         working-directory: . # Run from root
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7.0.0
         with:
-          node-version: "18.x"
+          node-version: "24"
           registry-url: "https://registry.npmjs.org/"
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci --ignore-scripts
 
       - name: Run Tests
         run: npm test
 
       - name: Publish to npm
-        run: npm publish --access public --no-git-checks
+        run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

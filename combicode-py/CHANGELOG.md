@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.0.0](https://github.com/aaurelions/combicode/compare/v2.0.0...v3.0.0) (2026-09-15)
+
+- Replace legacy archive extraction with validated, byte-length-framed records. Old archives must be regenerated.
+- Preserve UTF-8 contents, line endings, final newlines, empty files, and embedded fences across both runtimes.
+- Reject unsafe restore paths and symlinks; atomically replace files without modifying other hardlinks.
+- Apply packaged default ignores, honor nested negations, and normalize extension filters.
+- Separate archive and parser modules; fix filename collisions and code-range/byte-count errors.
+- Update dependencies and runtime requirements, remove unused native parsers, and add cross-runtime regression tests and CI.
+- Align human-readable byte-size formatting between the JavaScript and Python packages.
+- Correct documentation and make release preparation portable.
+
 ## [2.0.0](https://github.com/aaurelions/combicode/compare/combicode-py-v1.7.2...combicode-py-v2.0.0) (2026-02-28)
 
 ### Features

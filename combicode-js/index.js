@@ -1,20 +1,20 @@
 #!/usr/bin/env node
 
-const fs = require("fs");
-const path = require("path");
-const yargs = require("yargs/yargs");
-const { hideBin } = require("yargs/helpers");
+const fs = require("node:fs");
+const path = require("node:path");
 const ignore = require("ignore");
+const { parseCodeStructure, nestElements } = require("./lib/parsers");
+const { record, parseArchive, restore, encodePath, atomicWrite } = require("./lib/archive");
 
 const { version } = require("./package.json");
 
 // ---------------------------------------------------------------------------
-// System Prompts (v2.0.0)
+// System Prompts
 // ---------------------------------------------------------------------------
 
 const DEFAULT_SYSTEM_PROMPT = `You are an expert software architect. The user is providing you with the complete source code for a project, contained in a single file. Your task is to meticulously analyze the provided codebase to gain a comprehensive understanding of its structure, functionality, dependencies, and overall architecture.
 
-A code map with expanded tree structure \`<code_index>\` is provided below to give you a high-level overview. The subsequent section \`<merged_code>\` contain the full content of each file (read using the command \`sed -n '<ML_START>,<ML_END>p' combicode.txt\`), clearly marked with a file header.
+A code map with expanded tree structure \`<code_index>\` is provided below to give you a high-level overview. The subsequent section \`<merged_code>\` contains the full content of each file (read the ML line range from this output file), clearly marked with a file header.
 
 Your instructions are:
 1.  Analyze Thoroughly: Read through every file to understand its purpose and how it interacts with other files.
@@ -29,24 +29,24 @@ When answering questions or writing code, adhere strictly to the functions, vari
 A code map with expanded tree structure is provided below for a high-level overview.
 `;
 
-// Minimal safety ignores
-const SAFETY_IGNORES = [".git", ".DS_Store"];
+// Packaged defaults, synchronized from configs/ignore.json.
+const DEFAULT_IGNORES = require("./ignore.json");
 
 // ---------------------------------------------------------------------------
 // Utility helpers
 // ---------------------------------------------------------------------------
 
 function isLikelyBinary(filePath) {
-  const buffer = Buffer.alloc(512);
+  const buffer = Buffer.alloc(1024);
   let fd;
   try {
     fd = fs.openSync(filePath, "r");
-    const bytesRead = fs.readSync(fd, buffer, 0, 512, 0);
-    return buffer.slice(0, bytesRead).includes(0);
+    const bytesRead = fs.readSync(fd, buffer, 0, 1024, 0);
+    return buffer.subarray(0, bytesRead).includes(0);
   } catch (e) {
-    return true;
+    throw new Error(`Cannot read ${filePath}: ${e.message}`);
   } finally {
-    if (fd) fs.closeSync(fd);
+    if (fd !== undefined) fs.closeSync(fd);
   }
 }
 
@@ -55,1087 +55,19 @@ function formatBytes(bytes, decimals = 1) {
   const k = 1024;
   const dm = decimals < 0 ? 0 : decimals;
   const sizes = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + sizes[i];
+  const i = Math.min(sizes.length - 1, Math.floor(Math.log(bytes) / Math.log(k)));
+  // Round half up and drop a trailing ".0" (e.g. 2048 bytes is "2KB", not "2.0KB").
+  const factor = 10 ** dm;
+  const value = Math.round((bytes / Math.pow(k, i)) * factor) / factor;
+  return `${value}${sizes[i]}`;
 }
 
 // ---------------------------------------------------------------------------
 // Code Parsers (regex-based for all languages)
 // ---------------------------------------------------------------------------
 
-/**
- * Parse code structure from file content. Returns array of elements:
- * { type, label, startLine, endLine, startByte, endByte }
- *
- * type: "class" | "fn" | "async" | "ctor" | "loop" | "impl" | "test" | "describe"
- */
-function parseCodeStructure(filePath, content) {
-  const ext = path.extname(filePath).toLowerCase();
-  const lines = content.split("\n");
-
-  switch (ext) {
-    case ".py":
-      return parsePython(lines);
-    case ".js":
-    case ".jsx":
-    case ".mjs":
-    case ".cjs":
-      return parseJavaScript(lines);
-    case ".ts":
-    case ".tsx":
-    case ".mts":
-    case ".cts":
-      return parseTypeScript(lines);
-    case ".go":
-      return parseGo(lines);
-    case ".rs":
-      return parseRust(lines);
-    case ".java":
-      return parseJava(lines);
-    case ".c":
-    case ".h":
-    case ".cpp":
-    case ".hpp":
-    case ".cc":
-    case ".cxx":
-      return parseCCpp(lines);
-    case ".cs":
-      return parseCSharp(lines);
-    case ".php":
-      return parsePHP(lines);
-    case ".rb":
-      return parseRuby(lines);
-    case ".swift":
-      return parseSwift(lines);
-    case ".kt":
-    case ".kts":
-      return parseKotlin(lines);
-    case ".scala":
-    case ".sc":
-      return parseScala(lines);
-    case ".lua":
-      return parseLua(lines);
-    case ".pl":
-    case ".pm":
-      return parsePerl(lines);
-    case ".sh":
-    case ".bash":
-    case ".zsh":
-      return parseBash(lines);
-    default:
-      return [];
-  }
-}
-
-/**
- * Find the end of a block that starts at `startLine` using brace/indent counting.
- * For brace-based languages.
- */
-function findBraceBlockEnd(lines, startLine) {
-  let depth = 0;
-  let foundOpen = false;
-  for (let i = startLine; i < lines.length; i++) {
-    const line = lines[i];
-    for (const ch of line) {
-      if (ch === "{") {
-        depth++;
-        foundOpen = true;
-      } else if (ch === "}") {
-        depth--;
-        if (foundOpen && depth === 0) {
-          return i;
-        }
-      }
-    }
-  }
-  return lines.length - 1;
-}
-
-/**
- * Find block end for Python (indent-based).
- */
-function findIndentBlockEnd(lines, startLine) {
-  if (startLine >= lines.length) return startLine;
-  const defLine = lines[startLine];
-  const baseIndent = defLine.match(/^(\s*)/)[1].length;
-
-  for (let i = startLine + 1; i < lines.length; i++) {
-    const line = lines[i];
-    if (line.trim() === "") continue; // skip blank lines
-    const indent = line.match(/^(\s*)/)[1].length;
-    if (indent <= baseIndent) {
-      return i - 1;
-    }
-  }
-  return lines.length - 1;
-}
-
-/**
- * Find block end for Ruby-like (def/end, class/end, module/end).
- */
-function findRubyBlockEnd(lines, startLine) {
-  let depth = 0;
-  for (let i = startLine; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
-    // Keywords that open blocks
-    if (
-      /^(class|module|def|do|if|unless|case|while|until|for|begin)\b/.test(
-        trimmed,
-      ) ||
-      /\bdo\s*(\|[^|]*\|)?\s*$/.test(trimmed)
-    ) {
-      depth++;
-    }
-    if (/^end\b/.test(trimmed)) {
-      depth--;
-      if (depth === 0) return i;
-    }
-  }
-  return lines.length - 1;
-}
-
-/**
- * Find block end for Lua (function/end).
- */
-function findLuaBlockEnd(lines, startLine) {
-  let depth = 0;
-  for (let i = startLine; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
-    if (/\b(function|if|for|while|repeat)\b/.test(trimmed)) depth++;
-    if (
-      /^end\b/.test(trimmed) ||
-      /\bend\s*[,)\]]/.test(trimmed) ||
-      trimmed === "end"
-    ) {
-      depth--;
-      if (depth === 0) return i;
-    }
-  }
-  return lines.length - 1;
-}
-
-function computeByteSize(lines, startLine, endLine) {
-  let size = 0;
-  for (let i = startLine; i <= endLine && i < lines.length; i++) {
-    size += Buffer.byteLength(lines[i], "utf8") + 1; // +1 for newline
-  }
-  return size;
-}
-
-function buildElement(type, label, startLine, endLine, lines) {
-  return {
-    type,
-    label,
-    startLine: startLine + 1, // 1-indexed
-    endLine: endLine + 1,
-    size: computeByteSize(lines, startLine, endLine),
-  };
-}
-
-// --- Language Parsers ---
-
-function parsePython(lines) {
-  const elements = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const trimmed = line.trim();
-
-    // class
-    let m = trimmed.match(/^class\s+(\w+)(\(.*?\))?\s*:/);
-    if (m) {
-      const end = findIndentBlockEnd(lines, i);
-      elements.push(buildElement("class", `class ${m[1]}`, i, end, lines));
-      continue;
-    }
-
-    // async def
-    m = trimmed.match(/^async\s+def\s+(\w+)\s*\((.*?)\)(\s*->.*?)?\s*:/);
-    if (m) {
-      const end = findIndentBlockEnd(lines, i);
-      const sig = `${m[1]}(${m[2]})${m[3] || ""}`;
-      const type = m[1] === "__init__" ? "ctor" : "async";
-      elements.push(
-        buildElement(
-          type,
-          `${type === "ctor" ? "ctor" : "async"} ${sig}`,
-          i,
-          end,
-          lines,
-        ),
-      );
-      continue;
-    }
-
-    // def
-    m = trimmed.match(/^def\s+(\w+)\s*\((.*?)\)(\s*->.*?)?\s*:/);
-    if (m) {
-      const end = findIndentBlockEnd(lines, i);
-      const sig = `${m[1]}(${m[2]})${m[3] || ""}`;
-      let type = "fn";
-      if (m[1] === "__init__") type = "ctor";
-      else if (m[1].startsWith("test_")) type = "test";
-      const label =
-        type === "ctor"
-          ? `ctor ${sig}`
-          : type === "test"
-            ? `test ${sig}`
-            : `fn ${sig}`;
-      elements.push(buildElement(type, label, i, end, lines));
-      continue;
-    }
-
-    // for/while loops (> 5 lines)
-    m = trimmed.match(/^(for|while)\s+(.+):\s*$/);
-    if (m) {
-      const end = findIndentBlockEnd(lines, i);
-      if (end - i + 1 > 5) {
-        elements.push(
-          buildElement("loop", `loop ${m[1]} ${m[2]}`, i, end, lines),
-        );
-      }
-      continue;
-    }
-  }
-  return elements;
-}
-
-function parseJavaScript(lines) {
-  const elements = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const trimmed = line.trim();
-
-    // class
-    let m = trimmed.match(/^(export\s+)?(default\s+)?class\s+(\w+)/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("class", `class ${m[3]}`, i, end, lines));
-      continue;
-    }
-
-    // describe (test suite)
-    m = trimmed.match(/^describe\s*\(\s*['"`]([^'"`]+)['"`]/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(
-        buildElement("describe", `describe ${m[1]}`, i, end, lines),
-      );
-      continue;
-    }
-
-    // test/it blocks
-    m = trimmed.match(/^(it|test)\s*\(\s*['"`]([^'"`]+)['"`]/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("test", `test ${m[2]}`, i, end, lines));
-      continue;
-    }
-
-    // async function
-    m = trimmed.match(
-      /^(export\s+)?(default\s+)?async\s+function\s+(\w+)\s*\((.*?)\)/,
-    );
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(
-        buildElement("async", `async ${m[3]}(${m[4]})`, i, end, lines),
-      );
-      continue;
-    }
-
-    // function
-    m = trimmed.match(/^(export\s+)?(default\s+)?function\s+(\w+)\s*\((.*?)\)/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      const type = m[3] === "constructor" ? "ctor" : "fn";
-      elements.push(
-        buildElement(type, `${type} ${m[3]}(${m[4]})`, i, end, lines),
-      );
-      continue;
-    }
-
-    // arrow functions assigned to const/let/var (with explicit function body)
-    m = trimmed.match(
-      /^(export\s+)?(const|let|var)\s+(\w+)\s*=\s*(async\s+)?\(?(.*?)\)?\s*=>/,
-    );
-    if (m && (trimmed.includes("{") || i + 1 < lines.length)) {
-      // Only include if it has a block body
-      if (
-        trimmed.includes("{") ||
-        (i + 1 < lines.length && lines[i + 1].trim().startsWith("{"))
-      ) {
-        const end = findBraceBlockEnd(lines, i);
-        if (end > i) {
-          const isAsync = !!m[4];
-          const type = isAsync ? "async" : "fn";
-          elements.push(
-            buildElement(type, `${type} ${m[3]}(${m[5] || ""})`, i, end, lines),
-          );
-        }
-      }
-      continue;
-    }
-
-    // for/while loops (> 5 lines)
-    m = trimmed.match(/^(for|while)\s*\((.+)\)\s*\{?/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      if (end - i + 1 > 5) {
-        elements.push(
-          buildElement("loop", `loop ${m[1]} ${m[2]}`, i, end, lines),
-        );
-      }
-      continue;
-    }
-  }
-  return elements;
-}
-
-function parseTypeScript(lines) {
-  const elements = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const trimmed = line.trim();
-
-    // interface
-    let m = trimmed.match(/^(export\s+)?(default\s+)?interface\s+(\w+)/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("class", `interface ${m[3]}`, i, end, lines));
-      continue;
-    }
-
-    // class
-    m = trimmed.match(/^(export\s+)?(default\s+)?(abstract\s+)?class\s+(\w+)/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("class", `class ${m[4]}`, i, end, lines));
-      continue;
-    }
-
-    // describe
-    m = trimmed.match(/^describe\s*\(\s*['"`]([^'"`]+)['"`]/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(
-        buildElement("describe", `describe ${m[1]}`, i, end, lines),
-      );
-      continue;
-    }
-
-    // test/it
-    m = trimmed.match(/^(it|test)\s*\(\s*['"`]([^'"`]+)['"`]/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("test", `test ${m[2]}`, i, end, lines));
-      continue;
-    }
-
-    // async function
-    m = trimmed.match(
-      /^(export\s+)?(default\s+)?async\s+function\s+(\w+)\s*\((.*?)\)/,
-    );
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(
-        buildElement("async", `async ${m[3]}(${m[4]})`, i, end, lines),
-      );
-      continue;
-    }
-
-    // function
-    m = trimmed.match(/^(export\s+)?(default\s+)?function\s+(\w+)\s*\((.*?)\)/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("fn", `fn ${m[3]}(${m[4]})`, i, end, lines));
-      continue;
-    }
-
-    // arrow functions
-    m = trimmed.match(
-      /^(export\s+)?(const|let|var)\s+(\w+)\s*=\s*(async\s+)?\(?(.*?)\)?\s*=>/,
-    );
-    if (m && trimmed.includes("{")) {
-      const end = findBraceBlockEnd(lines, i);
-      if (end > i) {
-        const isAsync = !!m[4];
-        const type = isAsync ? "async" : "fn";
-        elements.push(
-          buildElement(type, `${type} ${m[3]}(${m[5] || ""})`, i, end, lines),
-        );
-      }
-      continue;
-    }
-
-    // for/while loops (> 5 lines)
-    m = trimmed.match(/^(for|while)\s*\((.+)\)\s*\{?/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      if (end - i + 1 > 5) {
-        elements.push(
-          buildElement("loop", `loop ${m[1]} ${m[2]}`, i, end, lines),
-        );
-      }
-    }
-  }
-  return elements;
-}
-
-function parseGo(lines) {
-  const elements = [];
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
-
-    // struct
-    let m = trimmed.match(/^type\s+(\w+)\s+struct\b/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("class", `struct ${m[1]}`, i, end, lines));
-      continue;
-    }
-
-    // interface
-    m = trimmed.match(/^type\s+(\w+)\s+interface\b/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("class", `interface ${m[1]}`, i, end, lines));
-      continue;
-    }
-
-    // func
-    m = trimmed.match(/^func\s+(\(.*?\)\s*)?(\w+)\s*\((.*?)\)/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      const receiver = m[1] ? m[1].trim() + " " : "";
-      const name = m[2];
-      const type = name.startsWith("Test") ? "test" : "fn";
-      elements.push(
-        buildElement(
-          type,
-          `${type === "test" ? "test" : "fn"} ${receiver}${name}(${m[3]})`,
-          i,
-          end,
-          lines,
-        ),
-      );
-      continue;
-    }
-
-    // for loops (> 5 lines) - Go only has for
-    m = trimmed.match(/^for\s+(.+)\s*\{/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      if (end - i + 1 > 5) {
-        elements.push(buildElement("loop", `loop for ${m[1]}`, i, end, lines));
-      }
-    }
-  }
-  return elements;
-}
-
-function parseRust(lines) {
-  const elements = [];
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
-
-    // struct
-    let m = trimmed.match(/^(pub\s+)?struct\s+(\w+)/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("class", `struct ${m[2]}`, i, end, lines));
-      continue;
-    }
-
-    // enum
-    m = trimmed.match(/^(pub\s+)?enum\s+(\w+)/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("class", `enum ${m[2]}`, i, end, lines));
-      continue;
-    }
-
-    // trait
-    m = trimmed.match(/^(pub\s+)?trait\s+(\w+)/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("class", `trait ${m[2]}`, i, end, lines));
-      continue;
-    }
-
-    // impl
-    m = trimmed.match(/^impl\s+(.+?)\s*\{/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("impl", `impl ${m[1]}`, i, end, lines));
-      continue;
-    }
-
-    // fn
-    m = trimmed.match(/^(pub\s+)?(async\s+)?fn\s+(\w+)\s*\((.*?)\)/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      const isAsync = !!m[2];
-      const isTest = m[3].startsWith("test_");
-      const type = isTest ? "test" : isAsync ? "async" : "fn";
-      elements.push(
-        buildElement(type, `${type} ${m[3]}(${m[4]})`, i, end, lines),
-      );
-      continue;
-    }
-
-    // loop/for/while (> 5 lines)
-    m = trimmed.match(/^(for|while|loop)\b(.*)?\{/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      if (end - i + 1 > 5) {
-        elements.push(
-          buildElement(
-            "loop",
-            `loop ${m[1]}${m[2] ? " " + m[2].trim() : ""}`,
-            i,
-            end,
-            lines,
-          ),
-        );
-      }
-    }
-  }
-  return elements;
-}
-
-function parseJava(lines) {
-  const elements = [];
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
-
-    // class
-    let m = trimmed.match(
-      /^(public\s+|private\s+|protected\s+)?(static\s+)?(abstract\s+)?(final\s+)?class\s+(\w+)/,
-    );
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("class", `class ${m[5]}`, i, end, lines));
-      continue;
-    }
-
-    // interface
-    m = trimmed.match(/^(public\s+|private\s+|protected\s+)?interface\s+(\w+)/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("class", `interface ${m[2]}`, i, end, lines));
-      continue;
-    }
-
-    // enum
-    m = trimmed.match(/^(public\s+|private\s+|protected\s+)?enum\s+(\w+)/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("class", `enum ${m[2]}`, i, end, lines));
-      continue;
-    }
-
-    // method (including constructors)
-    m = trimmed.match(
-      /^(public\s+|private\s+|protected\s+)?(static\s+)?(abstract\s+)?(final\s+)?(synchronized\s+)?(\w+\s+)?(\w+)\s*\((.*?)\)\s*(\{|throws)/,
-    );
-    if (
-      m &&
-      !["if", "for", "while", "switch", "catch", "return"].includes(m[7])
-    ) {
-      const end = findBraceBlockEnd(lines, i);
-      const name = m[7];
-      // Constructor: return type is absent and name matches class-like pattern
-      const hasReturnType = m[6] && m[6].trim();
-      const type = !hasReturnType
-        ? "ctor"
-        : name.startsWith("test")
-          ? "test"
-          : "fn";
-      elements.push(
-        buildElement(type, `${type} ${name}(${m[8]})`, i, end, lines),
-      );
-      continue;
-    }
-
-    // for/while loops (> 5 lines)
-    m = trimmed.match(/^(for|while)\s*\((.+)\)\s*\{?/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      if (end - i + 1 > 5) {
-        elements.push(
-          buildElement("loop", `loop ${m[1]} ${m[2]}`, i, end, lines),
-        );
-      }
-    }
-  }
-  return elements;
-}
-
-function parseCCpp(lines) {
-  const elements = [];
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
-
-    // class
-    let m = trimmed.match(/^class\s+(\w+)/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("class", `class ${m[1]}`, i, end, lines));
-      continue;
-    }
-
-    // struct
-    m = trimmed.match(/^(typedef\s+)?struct\s+(\w+)/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("class", `struct ${m[2]}`, i, end, lines));
-      continue;
-    }
-
-    // function (C-style: return_type name(...))
-    m = trimmed.match(/^(\w[\w\s*&]+?)\s+(\w+)\s*\(([^)]*)\)\s*(\{|$)/);
-    if (
-      m &&
-      ![
-        "if",
-        "for",
-        "while",
-        "switch",
-        "return",
-        "typedef",
-        "struct",
-        "class",
-        "enum",
-      ].includes(m[2])
-    ) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("fn", `fn ${m[2]}(${m[3]})`, i, end, lines));
-      continue;
-    }
-
-    // for/while loops (> 5 lines)
-    m = trimmed.match(/^(for|while)\s*\((.+)\)\s*\{?/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      if (end - i + 1 > 5) {
-        elements.push(
-          buildElement("loop", `loop ${m[1]} ${m[2]}`, i, end, lines),
-        );
-      }
-    }
-  }
-  return elements;
-}
-
-function parseCSharp(lines) {
-  const elements = [];
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
-
-    // class / struct / interface / enum / record
-    let m = trimmed.match(
-      /^(public\s+|private\s+|protected\s+|internal\s+)?(static\s+)?(abstract\s+|sealed\s+)?(partial\s+)?(class|struct|interface|enum|record)\s+(\w+)/,
-    );
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("class", `${m[5]} ${m[6]}`, i, end, lines));
-      continue;
-    }
-
-    // method
-    m = trimmed.match(
-      /^(public\s+|private\s+|protected\s+|internal\s+)?(static\s+)?(async\s+)?(virtual\s+|override\s+|abstract\s+)?(\w[\w<>\[\],\s]*?)\s+(\w+)\s*\((.*?)\)\s*\{?/,
-    );
-    if (
-      m &&
-      ![
-        "if",
-        "for",
-        "while",
-        "switch",
-        "catch",
-        "return",
-        "class",
-        "struct",
-        "interface",
-        "enum",
-      ].includes(m[6])
-    ) {
-      const end = findBraceBlockEnd(lines, i);
-      const isAsync = !!m[3];
-      const type = isAsync ? "async" : "fn";
-      elements.push(
-        buildElement(type, `${type} ${m[6]}(${m[7]})`, i, end, lines),
-      );
-      continue;
-    }
-
-    // for/while loops (> 5 lines)
-    m = trimmed.match(/^(for|foreach|while)\s*\((.+)\)\s*\{?/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      if (end - i + 1 > 5) {
-        elements.push(
-          buildElement("loop", `loop ${m[1]} ${m[2]}`, i, end, lines),
-        );
-      }
-    }
-  }
-  return elements;
-}
-
-function parsePHP(lines) {
-  const elements = [];
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
-
-    // class / interface / trait
-    let m = trimmed.match(
-      /^(abstract\s+)?(final\s+)?(class|interface|trait)\s+(\w+)/,
-    );
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("class", `${m[3]} ${m[4]}`, i, end, lines));
-      continue;
-    }
-
-    // function
-    m = trimmed.match(
-      /^(public\s+|private\s+|protected\s+)?(static\s+)?function\s+(\w+)\s*\((.*?)\)/,
-    );
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      const type =
-        m[3] === "__construct"
-          ? "ctor"
-          : m[3].startsWith("test")
-            ? "test"
-            : "fn";
-      elements.push(
-        buildElement(type, `${type} ${m[3]}(${m[4]})`, i, end, lines),
-      );
-      continue;
-    }
-
-    // for/while loops (> 5 lines)
-    m = trimmed.match(/^(for|foreach|while)\s*\((.+)\)\s*\{?/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      if (end - i + 1 > 5) {
-        elements.push(
-          buildElement("loop", `loop ${m[1]} ${m[2]}`, i, end, lines),
-        );
-      }
-    }
-  }
-  return elements;
-}
-
-function parseRuby(lines) {
-  const elements = [];
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
-
-    // class
-    let m = trimmed.match(/^class\s+(\w+)/);
-    if (m) {
-      const end = findRubyBlockEnd(lines, i);
-      elements.push(buildElement("class", `class ${m[1]}`, i, end, lines));
-      continue;
-    }
-
-    // module
-    m = trimmed.match(/^module\s+(\w+)/);
-    if (m) {
-      const end = findRubyBlockEnd(lines, i);
-      elements.push(buildElement("class", `module ${m[1]}`, i, end, lines));
-      continue;
-    }
-
-    // def
-    m = trimmed.match(/^def\s+(self\.)?(\w+[?!=]?)\s*(\(.*?\))?/);
-    if (m) {
-      const end = findRubyBlockEnd(lines, i);
-      const prefix = m[1] || "";
-      const type =
-        m[2] === "initialize"
-          ? "ctor"
-          : m[2].startsWith("test_")
-            ? "test"
-            : "fn";
-      elements.push(
-        buildElement(
-          type,
-          `${type} ${prefix}${m[2]}${m[3] || ""}`,
-          i,
-          end,
-          lines,
-        ),
-      );
-      continue;
-    }
-  }
-  return elements;
-}
-
-function parseSwift(lines) {
-  const elements = [];
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
-
-    // class / struct / enum / protocol
-    let m = trimmed.match(
-      /^(public\s+|private\s+|internal\s+|open\s+|fileprivate\s+)?(final\s+)?(class|struct|enum|protocol)\s+(\w+)/,
-    );
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("class", `${m[3]} ${m[4]}`, i, end, lines));
-      continue;
-    }
-
-    // func
-    m = trimmed.match(
-      /^(public\s+|private\s+|internal\s+|open\s+)?(static\s+|class\s+)?(override\s+)?func\s+(\w+)\s*\((.*?)\)/,
-    );
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      const name = m[4];
-      const type =
-        name === "init" ? "ctor" : name.startsWith("test") ? "test" : "fn";
-      elements.push(
-        buildElement(type, `${type} ${name}(${m[5]})`, i, end, lines),
-      );
-      continue;
-    }
-
-    // for/while loops (> 5 lines)
-    m = trimmed.match(/^(for|while)\s+(.+)\s*\{/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      if (end - i + 1 > 5) {
-        elements.push(
-          buildElement("loop", `loop ${m[1]} ${m[2]}`, i, end, lines),
-        );
-      }
-    }
-  }
-  return elements;
-}
-
-function parseKotlin(lines) {
-  const elements = [];
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
-
-    // class / interface / object
-    let m = trimmed.match(
-      /^(open\s+|abstract\s+|data\s+|sealed\s+)?(class|interface|object)\s+(\w+)/,
-    );
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("class", `${m[2]} ${m[3]}`, i, end, lines));
-      continue;
-    }
-
-    // fun
-    m = trimmed.match(
-      /^(public\s+|private\s+|protected\s+|internal\s+)?(override\s+)?(suspend\s+)?fun\s+(\w+)\s*\((.*?)\)/,
-    );
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      const isSuspend = !!m[3];
-      const type = m[4].startsWith("test")
-        ? "test"
-        : isSuspend
-          ? "async"
-          : "fn";
-      elements.push(
-        buildElement(type, `${type} ${m[4]}(${m[5]})`, i, end, lines),
-      );
-      continue;
-    }
-
-    // for/while loops (> 5 lines)
-    m = trimmed.match(/^(for|while)\s*\((.+)\)\s*\{?/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      if (end - i + 1 > 5) {
-        elements.push(
-          buildElement("loop", `loop ${m[1]} ${m[2]}`, i, end, lines),
-        );
-      }
-    }
-  }
-  return elements;
-}
-
-function parseScala(lines) {
-  const elements = [];
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
-
-    // class / object / trait
-    let m = trimmed.match(/^(case\s+)?(class|object|trait)\s+(\w+)/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(
-        buildElement("class", `${m[1] || ""}${m[2]} ${m[3]}`, i, end, lines),
-      );
-      continue;
-    }
-
-    // def
-    m = trimmed.match(/^(override\s+)?def\s+(\w+)\s*(\(.*?\))?/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      const type = m[2].startsWith("test") ? "test" : "fn";
-      elements.push(
-        buildElement(type, `${type} ${m[2]}${m[3] || ""}`, i, end, lines),
-      );
-      continue;
-    }
-  }
-  return elements;
-}
-
-function parseLua(lines) {
-  const elements = [];
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
-
-    // function / local function
-    let m = trimmed.match(/^(local\s+)?function\s+([\w.:]+)\s*\((.*?)\)/);
-    if (m) {
-      const end = findLuaBlockEnd(lines, i);
-      elements.push(buildElement("fn", `fn ${m[2]}(${m[3]})`, i, end, lines));
-      continue;
-    }
-
-    // for/while loops (> 5 lines)
-    m = trimmed.match(/^(for|while)\s+(.+)\s+do/);
-    if (m) {
-      const end = findLuaBlockEnd(lines, i);
-      if (end - i + 1 > 5) {
-        elements.push(
-          buildElement("loop", `loop ${m[1]} ${m[2]}`, i, end, lines),
-        );
-      }
-    }
-  }
-  return elements;
-}
-
-function parsePerl(lines) {
-  const elements = [];
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
-
-    // package
-    let m = trimmed.match(/^package\s+([\w:]+)/);
-    if (m) {
-      elements.push(buildElement("class", `package ${m[1]}`, i, i, lines));
-      continue;
-    }
-
-    // sub
-    m = trimmed.match(/^sub\s+(\w+)/);
-    if (m) {
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("fn", `fn ${m[1]}`, i, end, lines));
-      continue;
-    }
-  }
-  return elements;
-}
-
-function parseBash(lines) {
-  const elements = [];
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
-
-    // function keyword or name()
-    let m = trimmed.match(/^(function\s+)?(\w+)\s*\(\s*\)\s*\{?/);
-    if (m && m[1]) {
-      // function keyword form
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("fn", `fn ${m[2]}`, i, end, lines));
-      continue;
-    }
-    if (m && !m[1] && trimmed.includes("()")) {
-      // name() form
-      const end = findBraceBlockEnd(lines, i);
-      elements.push(buildElement("fn", `fn ${m[2]}`, i, end, lines));
-      continue;
-    }
-
-    // for/while loops (> 5 lines)
-    m = trimmed.match(/^(for|while)\s+(.+?);\s*do/);
-    if (!m) m = trimmed.match(/^(for|while)\s+(.+)/);
-    if (m) {
-      // Look for done
-      let end = i;
-      for (let j = i + 1; j < lines.length; j++) {
-        if (lines[j].trim() === "done") {
-          end = j;
-          break;
-        }
-      }
-      if (end - i + 1 > 5) {
-        elements.push(
-          buildElement("loop", `loop ${m[1]} ${m[2]}`, i, end, lines),
-        );
-      }
-    }
-  }
-  return elements;
-}
-
 // ---------------------------------------------------------------------------
-// Nesting + Tree Building
-// ---------------------------------------------------------------------------
-
-/**
- * Nest flat elements into a tree based on line ranges.
- * Elements that fall within the range of a parent become children.
- */
-function nestElements(elements) {
-  if (!elements.length) return [];
-
-  // Sort by start line, then by larger range first (parents before children)
-  const sorted = [...elements].sort((a, b) => {
-    if (a.startLine !== b.startLine) return a.startLine - b.startLine;
-    return b.endLine - b.startLine - (a.endLine - a.startLine);
-  });
-
-  const root = [];
-  const stack = []; // stack of { element, children }
-
-  for (const el of sorted) {
-    const node = { ...el, children: [] };
-
-    // Pop from stack if current element is outside of parent's range
-    while (stack.length > 0) {
-      const parent = stack[stack.length - 1];
-      if (el.startLine >= parent.startLine && el.endLine <= parent.endLine) {
-        break;
-      }
-      stack.pop();
-    }
-
-    if (stack.length > 0) {
-      stack[stack.length - 1].children.push(node);
-    } else {
-      root.push(node);
-    }
-
-    stack.push(node);
-  }
-
-  return root;
-}
-
-// ---------------------------------------------------------------------------
-// Directory Walker (unchanged from v1)
+// Directory Walker
 // ---------------------------------------------------------------------------
 
 function walkDirectory(
@@ -1157,7 +89,9 @@ function walkDirectory(
         const content = fs.readFileSync(gitignorePath, "utf8");
         const ig = ignore().add(content);
         currentIgnoreManager = { manager: ig, root: currentDir };
-      } catch (e) {}
+      } catch (e) {
+        throw new Error(`Cannot read ignore configuration: ${e.message}`);
+      }
     }
   }
 
@@ -1169,7 +103,7 @@ function walkDirectory(
   try {
     entries = fs.readdirSync(currentDir, { withFileTypes: true });
   } catch (e) {
-    return [];
+    throw new Error(`Cannot scan ${currentDir}: ${e.message}`);
   }
 
   for (const entry of entries) {
@@ -1178,7 +112,7 @@ function walkDirectory(
     if (path.resolve(fullPath) === absoluteOutputPath) continue;
 
     let shouldIgnore = false;
-    for (const item of nextIgnoreChain) {
+    for (const [index, item] of nextIgnoreChain.entries()) {
       let relToIgnoreRoot = path.relative(item.root, fullPath);
       if (path.sep === "\\") {
         relToIgnoreRoot = relToIgnoreRoot.replace(/\\/g, "/");
@@ -1186,10 +120,10 @@ function walkDirectory(
       if (entry.isDirectory() && !relToIgnoreRoot.endsWith("/")) {
         relToIgnoreRoot += "/";
       }
-      if (item.manager.ignores(relToIgnoreRoot)) {
-        shouldIgnore = true;
-        break;
-      }
+      const result = item.manager.test(relToIgnoreRoot);
+      if (result.ignored) shouldIgnore = true;
+      if (result.unignored) shouldIgnore = false;
+      if (index === 0 && shouldIgnore) break;
     }
 
     if (shouldIgnore) {
@@ -1214,21 +148,22 @@ function walkDirectory(
         stats.ignored++;
         continue;
       }
-      if (allowedExts && !allowedExts.has(path.extname(entry.name))) {
+      if (allowedExts && !allowedExts.has(path.extname(entry.name).toLowerCase())) {
         stats.ignored++;
         continue;
       }
       try {
         const fileStats = fs.statSync(fullPath);
         const relativeToRoot = path.relative(rootDir, fullPath);
-        stats.scanned++;
         results.push({
           path: fullPath,
           relativePath: relativeToRoot,
           size: fileStats.size,
           formattedSize: formatBytes(fileStats.size),
         });
-      } catch (e) {}
+      } catch (e) {
+        throw new Error(`Cannot read ignore configuration: ${e.message}`);
+      }
     }
   }
 
@@ -1236,17 +171,17 @@ function walkDirectory(
 }
 
 // ---------------------------------------------------------------------------
-// Code Index Tree Generator (v2.0.0)
+// Code Index Tree Generator
 // ---------------------------------------------------------------------------
 
 /**
  * Build the <code_index> tree with expanded code elements.
  */
 function generateCodeIndex(filesWithMeta, root, skipContentSet, noParse) {
-  let tree = `${path.basename(root)}/\n`;
+  let tree = `${encodePath(path.basename(root))}/\n`;
 
   // Build directory structure
-  const structure = {};
+  const structure = { children: Object.create(null) };
   for (const file of filesWithMeta) {
     const parts = file.relativePath.split(path.sep);
     let currentLevel = structure;
@@ -1254,31 +189,31 @@ function generateCodeIndex(filesWithMeta, root, skipContentSet, noParse) {
       const part = parts[i];
       const isFile = i === parts.length - 1;
       if (isFile) {
-        currentLevel[part] = { __file: file };
+        currentLevel.children[part] = { file };
       } else {
-        if (!currentLevel[part]) currentLevel[part] = {};
-        currentLevel = currentLevel[part];
+        currentLevel.children[part] ??= { children: Object.create(null) };
+        currentLevel = currentLevel.children[part];
       }
     }
   }
 
   function renderTree(level, prefix) {
-    const keys = Object.keys(level);
+    const keys = Object.keys(level.children).sort();
     for (let i = 0; i < keys.length; i++) {
       const key = keys[i];
       const isLast = i === keys.length - 1;
       const connector = isLast ? "\u2514\u2500\u2500 " : "\u251c\u2500\u2500 ";
       const childPrefix = prefix + (isLast ? "    " : "\u2502   ");
-      const value = level[key];
+      const value = level.children[key];
 
-      if (value.__file) {
-        const f = value.__file;
-        const olRange = `OL: 1-${f.lineCount}`;
+      if (value.file) {
+        const f = value.file;
+        const olRange = `OL: ${f.lineCount ? 1 : 0}-${f.lineCount}`;
         const mlRange = `ML: ${f.mlStart}-${f.mlEnd}`;
         const sizeStr = f.formattedSize;
         const isSkipped = skipContentSet && skipContentSet.has(f.relativePath);
 
-        tree += `${prefix}${connector}${key} [${olRange} | ${mlRange} | ${sizeStr}]\n`;
+        tree += `${prefix}${connector}${encodePath(key)} [${olRange} | ${mlRange} | ${sizeStr}]\n`;
 
         if (isSkipped) {
           tree += `${childPrefix}(Content omitted - file size: ${sizeStr})\n`;
@@ -1287,7 +222,7 @@ function generateCodeIndex(filesWithMeta, root, skipContentSet, noParse) {
         }
       } else {
         // Directory
-        tree += `${prefix}${connector}${key}/\n`;
+        tree += `${prefix}${connector}${encodePath(key)}/\n`;
         renderTree(value, childPrefix);
       }
     }
@@ -1319,78 +254,16 @@ function generateCodeIndex(filesWithMeta, root, skipContentSet, noParse) {
 }
 
 // ---------------------------------------------------------------------------
-// Recreate functionality (v2.0.0)
+// Recreate functionality
 // ---------------------------------------------------------------------------
 
 function recreateFromFile(inputFile, outputDir, dryRun, overwrite) {
-  if (!fs.existsSync(inputFile)) {
-    console.error(`\n\u274c Input file not found: ${inputFile}`);
-    process.exit(1);
-  }
-
-  const content = fs.readFileSync(inputFile, "utf8");
-
-  // Parse files from the merged_code section (or legacy format)
-  const files = [];
-  // Match: # FILE: path [...]  followed by ```` block
-  const fileRegex = /# FILE:\s*(.+?)\s*\[.*?\]\n````\n([\s\S]*?)\n````/g;
-  let match;
-
-  while ((match = fileRegex.exec(content)) !== null) {
-    const filePath = match[1].trim();
-    const fileContent = match[2];
-
-    // Skip content-omitted files
-    if (fileContent.trim().startsWith("(Content omitted")) continue;
-
-    files.push({ path: filePath, content: fileContent });
-  }
-
-  if (files.length === 0) {
-    // Try legacy format: ### **FILE:** `path`
-    const legacyRegex = /### \*\*FILE:\*\*\s*`(.+?)`\n````\n([\s\S]*?)\n````/g;
-    while ((match = legacyRegex.exec(content)) !== null) {
-      const filePath = match[1].trim();
-      const fileContent = match[2];
-      if (fileContent.trim().startsWith("(Content omitted")) continue;
-      files.push({ path: filePath, content: fileContent });
-    }
-  }
-
-  if (files.length === 0) {
-    console.error("\n\u274c No files found in the input file.");
-    process.exit(1);
-  }
-
-  const resolvedOutputDir = path.resolve(outputDir);
-  console.log(`\n\ud83d\udcc2 Output directory: ${resolvedOutputDir}\n`);
-
-  let totalSize = 0;
-
-  for (const file of files) {
-    const fullPath = path.join(resolvedOutputDir, file.path);
-    const size = Buffer.byteLength(file.content, "utf8");
-    totalSize += size;
-
-    console.log(`   ${file.path} (${formatBytes(size)})`);
-
-    if (!dryRun) {
-      if (fs.existsSync(fullPath) && !overwrite) {
-        console.error(`   \u26a0\ufe0f  Skipped (exists): ${file.path}`);
-        continue;
-      }
-      const dir = path.dirname(fullPath);
-      fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(fullPath, file.content, "utf8");
-    }
-  }
-
-  console.log(`\n\ud83d\udcca Summary:`);
+  const files = parseArchive(fs.readFileSync(inputFile));
+  const { count, bytes } = restore(files, outputDir, dryRun, overwrite);
+  for (const file of files) console.log(`   ${encodePath(file.path)}`);
   console.log(
-    `   \u2022 ${dryRun ? "Files to recreate" : "Files recreated"}: ${files.length}`,
+    `${dryRun ? "Files to recreate" : "Files recreated"}: ${count} (${formatBytes(bytes)})`,
   );
-  console.log(`   \u2022 Total size: ${formatBytes(totalSize)}`);
-  console.log(`\n\u2705 Done!`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1398,6 +271,8 @@ function recreateFromFile(inputFile, outputDir, dryRun, overwrite) {
 // ---------------------------------------------------------------------------
 
 async function main() {
+  const { default: yargs } = await import("yargs/yargs");
+  const { hideBin } = await import("yargs/helpers");
   const rawArgv = hideBin(process.argv);
   if (rawArgv.includes("--version") || rawArgv.includes("-v")) {
     console.log(`Combicode (JavaScript), version ${version}`);
@@ -1406,6 +281,7 @@ async function main() {
 
   const argv = yargs(rawArgv)
     .scriptName("combicode")
+    .strict()
     .usage("$0 [options]")
     .option("o", {
       alias: "output",
@@ -1446,8 +322,7 @@ async function main() {
       default: true,
     })
     .option("skip-content", {
-      describe:
-        "Comma-separated glob patterns for files to include in tree but omit content",
+      describe: "Comma-separated glob patterns for files to include in tree but omit content",
       type: "string",
     })
     .option("parse", {
@@ -1483,15 +358,14 @@ async function main() {
   // --- Recreate mode ---
   if (argv.recreate) {
     const inputFile = path.resolve(projectRoot, argv.input);
-    const outputDir =
-      argv.output !== "combicode.txt" ? argv.output : projectRoot;
+    const outputDir = argv.output !== "combicode.txt" ? argv.output : projectRoot;
     recreateFromFile(inputFile, outputDir, argv.dryRun, argv.overwrite);
     return;
   }
 
   // --- Combine mode ---
   const rootIgnoreManager = ignore();
-  rootIgnoreManager.add(SAFETY_IGNORES);
+  rootIgnoreManager.add(DEFAULT_IGNORES);
 
   if (argv.exclude) {
     rootIgnoreManager.add(argv.exclude.split(","));
@@ -1507,7 +381,9 @@ async function main() {
         const m = line.match(/^\s*path\s*=\s*(.+?)\s*$/);
         if (m) rootIgnoreManager.add([m[1]]);
       }
-    } catch (e) {}
+    } catch (e) {
+      throw new Error(`Cannot read ignore configuration: ${e.message}`);
+    }
   }
 
   const skipContentManager = ignore();
@@ -1521,12 +397,14 @@ async function main() {
     ? new Set(
         argv.includeExt
           .split(",")
+          .map((ext) => ext.trim().toLowerCase())
+          .filter(Boolean)
           .map((ext) => (ext.startsWith(".") ? ext : `.${ext}`)),
       )
     : null;
 
   const ignoreChain = [{ manager: rootIgnoreManager, root: projectRoot }];
-  const stats = { scanned: 0, ignored: 0 };
+  const stats = { ignored: 0 };
 
   const includedFiles = walkDirectory(
     projectRoot,
@@ -1538,7 +416,7 @@ async function main() {
     stats,
   );
 
-  includedFiles.sort((a, b) => a.path.localeCompare(b.path));
+  includedFiles.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 
   // Determine skip-content set
   const skipContentSet = new Set();
@@ -1552,9 +430,7 @@ async function main() {
   }
 
   if (includedFiles.length === 0) {
-    console.error(
-      "\n\u274c No files to include. Check your path, .gitignore, or filters.",
-    );
+    console.error("\n\u274c No files to include. Check your path, .gitignore, or filters.");
     process.exit(1);
   }
 
@@ -1567,119 +443,53 @@ async function main() {
       fileObj.codeElements = [];
     } else {
       try {
-        fileObj.content = fs.readFileSync(fileObj.path, "utf8");
+        fileObj.content = new TextDecoder("utf-8", {
+          fatal: true,
+          ignoreBOM: true,
+        }).decode(fs.readFileSync(fileObj.path));
+        fileObj.size = Buffer.byteLength(fileObj.content);
+        fileObj.formattedSize = formatBytes(fileObj.size);
         // Count actual lines: strings ending with \n get an extra empty element from split
         const parts = fileObj.content.split("\n");
-        fileObj.lineCount = fileObj.content.endsWith("\n")
-          ? parts.length - 1
-          : parts.length;
+        fileObj.lineCount =
+          fileObj.content === ""
+            ? 0
+            : fileObj.content.endsWith("\n")
+              ? parts.length - 1
+              : parts.length;
 
         if (argv.parse) {
-          const flat = parseCodeStructure(
-            fileObj.relativePath,
-            fileObj.content,
-          );
+          const flat = parseCodeStructure(fileObj.relativePath, fileObj.content);
           fileObj.codeElements = nestElements(flat);
         } else {
           fileObj.codeElements = [];
         }
       } catch (e) {
-        fileObj.content = `... (error reading file: ${e.message}) ...`;
-        fileObj.lineCount = 1;
-        fileObj.codeElements = [];
+        throw new Error(`Cannot read ${fileObj.relativePath}: ${e.message}`);
       }
     }
   }
 
-  // --- Calculate ML (Merged Line) offsets ---
-  // First pass: figure out how many header lines come before merged_code
-  const systemPrompt = argv.llmsTxt
-    ? LLMS_TXT_SYSTEM_PROMPT
-    : DEFAULT_SYSTEM_PROMPT;
-  let headerLines = 0;
-  if (argv.header) {
-    headerLines += systemPrompt.split("\n").length; // system prompt
-    headerLines += 1; // blank line after prompt
-    // <code_index> section will be added but we need to calculate it after ML offsets are known
-    // We'll do a two-pass approach
+  const systemPrompt = argv.llmsTxt ? LLMS_TXT_SYSTEM_PROMPT : DEFAULT_SYSTEM_PROMPT;
+  for (const file of includedFiles) {
+    file.mlStart = file.mlEnd = 1;
   }
-
-  // Two-pass: first compute code_index size, then compute ML offsets
-  // Pass 1: Assign provisional ML offsets (we'll need the code_index line count first)
-  // The structure is: header + code_index_block + merged_code_block
-
-  // Compute provisional line count for each file in merged_code
-  // Each file: "# FILE: path [...]\n````\n" + content + "\n````\n"  = 4 lines + content lines
-  let mergedCodeHeaderLine = 1; // Will be set properly
-  let currentMl = 1;
-
-  // We need to do this iteratively:
-  // 1. Calculate code_index with placeholder MLs
-  // 2. Count code_index lines
-  // 3. Calculate real MLs
-  // 4. Regenerate code_index with real MLs
-
-  // Step 1: Assign temporary ML values
-  let tempMl = 1; // placeholder
-  for (const fileObj of includedFiles) {
-    fileObj.mlStart = tempMl;
-    const isSkipped = skipContentSet.has(fileObj.relativePath);
-    if (isSkipped) {
-      fileObj.mlEnd = tempMl + 1; // placeholder line
-      tempMl += 4 + 1; // header(2) + placeholder(1) + footer(1) = 4
-    } else {
-      fileObj.mlEnd = tempMl + fileObj.lineCount - 1;
-      tempMl += 4 + fileObj.lineCount; // header(2) + content + footer(2)
-    }
-  }
-
-  // Step 2: Generate provisional code_index to count lines
-  let codeIndex = generateCodeIndex(
-    includedFiles,
-    projectRoot,
-    skipContentSet,
-    !argv.parse,
-  );
-  // codeIndex ends with \n, so split produces an extra empty element
-  const codeIndexLineCount = codeIndex.endsWith("\n")
-    ? codeIndex.split("\n").length - 1
-    : codeIndex.split("\n").length;
-
-  // Step 3: Calculate real header line count
-  let totalHeaderLines = 0;
-  if (argv.header) {
-    totalHeaderLines += systemPrompt.split("\n").length; // prompt lines + blank line from extra \n
-    totalHeaderLines += 1; // "<code_index>"
-    totalHeaderLines += codeIndexLineCount; // code index content
-    totalHeaderLines += 1; // "</code_index>"
-    totalHeaderLines += 1; // blank line
-    totalHeaderLines += 1; // "<merged_code>"
-  } else {
-    totalHeaderLines += 1; // "<merged_code>"
-  }
-
-  // Step 4: Recalculate ML offsets with real header
-  currentMl = totalHeaderLines + 1;
-  for (const fileObj of includedFiles) {
-    const isSkipped = skipContentSet.has(fileObj.relativePath);
-    // File header: "# FILE: path [...]\n````\n" = 2 lines
-    fileObj.mlStart = currentMl + 2; // Content starts after header
-    if (isSkipped) {
-      fileObj.mlEnd = fileObj.mlStart; // 1 line placeholder
-      currentMl += 2 + 1 + 2; // header(2) + placeholder(1) + footer(2: "\n````\n")
-    } else {
-      fileObj.mlEnd = fileObj.mlStart + fileObj.lineCount - 1;
-      currentMl += 2 + fileObj.lineCount + 2; // header(2) + content + footer(2)
-    }
-  }
-
-  // Step 5: Regenerate code_index with correct MLs
-  codeIndex = generateCodeIndex(
-    includedFiles,
-    projectRoot,
-    skipContentSet,
-    !argv.parse,
-  );
+  const makeIndex = () =>
+    generateCodeIndex(includedFiles, projectRoot, skipContentSet, !argv.parse);
+  const makeHeader = () =>
+    argv.header
+      ? `${systemPrompt.trimEnd()}\n\n<code_index>\n${makeIndex()}</code_index>\n\n<merged_code>\n`
+      : "<merged_code>\n";
+  let currentMl = makeHeader().split("\n").length;
+  const records = includedFiles.map((file) => {
+    file.mlStart = currentMl + 2;
+    file.mlEnd = file.mlStart + Math.max(1, file.lineCount) - 1;
+    const metadata = `OL: ${file.lineCount ? 1 : 0}-${file.lineCount} | ML: ${file.mlStart}-${file.mlEnd} | ${file.formattedSize}`;
+    const serialized = record(file.relativePath.split(path.sep).join("/"), metadata, file.content);
+    currentMl += serialized.split("\n").length - 1;
+    return serialized;
+  });
+  const codeIndex = makeIndex();
 
   // Calculate total content size
   const totalSizeBytes = includedFiles.reduce((acc, file) => {
@@ -1701,63 +511,13 @@ async function main() {
     return;
   }
 
-  // --- Write output ---
-  const outputStream = fs.createWriteStream(argv.output);
-  let totalLines = 0;
-
-  if (argv.header) {
-    outputStream.write(systemPrompt + "\n");
-    totalLines += systemPrompt.split("\n").length + 1;
-
-    outputStream.write("<code_index>\n");
-    outputStream.write(codeIndex);
-    outputStream.write("</code_index>\n\n");
-    totalLines += codeIndexLineCount + 3;
-
-    outputStream.write("<merged_code>\n");
-    totalLines += 1;
-  } else {
-    outputStream.write("<merged_code>\n");
-    totalLines += 1;
-  }
-
-  for (const fileObj of includedFiles) {
-    const relativePath = fileObj.relativePath.replace(/\\/g, "/");
-    const isSkipped = skipContentSet.has(fileObj.relativePath);
-
-    const olRange = `OL: 1-${fileObj.lineCount}`;
-    const mlRange = `ML: ${fileObj.mlStart}-${fileObj.mlEnd}`;
-    const sizeStr = fileObj.formattedSize;
-
-    outputStream.write(
-      `# FILE: ${relativePath} [${olRange} | ${mlRange} | ${sizeStr}]\n`,
-    );
-    outputStream.write("````\n");
-    totalLines += 2;
-
-    if (isSkipped) {
-      outputStream.write(`(Content omitted - file size: ${sizeStr})\n`);
-      totalLines += 1;
-    } else {
-      outputStream.write(fileObj.content);
-      if (!fileObj.content.endsWith("\n")) {
-        outputStream.write("\n");
-      }
-      totalLines += fileObj.lineCount;
-    }
-
-    outputStream.write("````\n\n");
-    totalLines += 2;
-  }
-
-  outputStream.write("</merged_code>\n");
-  totalLines += 1;
-  outputStream.end();
+  const output = makeHeader() + records.join("") + "</merged_code>\n";
+  fs.mkdirSync(path.dirname(absoluteOutputPath), { recursive: true });
+  atomicWrite(absoluteOutputPath, output);
+  const totalLines = output.split("\n").length - 1;
 
   console.log(`\n\ud83d\udcca Summary:`);
-  console.log(
-    `   \u2022 Included: ${includedFiles.length} files (${formatBytes(totalSizeBytes)})`,
-  );
+  console.log(`   \u2022 Included: ${includedFiles.length} files (${formatBytes(totalSizeBytes)})`);
   if (skipContentSet.size > 0) {
     console.log(`   \u2022 Content omitted: ${skipContentSet.size} files`);
   }

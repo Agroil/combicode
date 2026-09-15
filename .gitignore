@@ -147,3 +147,12 @@ ENV/
 *.sublime-* 
 
 combicode.txt
+# Synchronized package assets
+combicode-js/README.md
+combicode-js/LICENSE
+combicode-js/ignore.json
+combicode-py/README.md
+combicode-py/LICENSE
+combicode-py/combicode/ignore.json
+.pytest_cache/
+.ruff_cache/
